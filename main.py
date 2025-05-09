@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response # ADDED 'Response' HERE
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from youtube_transcript_api.formatters import TextFormatter # ADDED LINE
+from youtube_transcript_api.formatters import TextFormatter
 import os
 
 app = Flask(__name__)
@@ -12,11 +12,11 @@ def home():
 @app.route('/api/transcript', methods=['GET'])
 def get_transcript_api():
     video_id = request.args.get('video_id')
-    # ADDED LINE: Get the desired output format, default to 'json' (structured)
-    output_format = request.args.get('format', 'json').lower() 
+    output_format = request.args.get('format', 'json').lower()
 
     if not video_id:
-        return jsonify({"error": "Missing 'video_id' parameter in the URL"}), 400
+        # For API consistency, error messages are still JSON
+        return jsonify({"error": "Missing 'video_id' parameter in the URL"}), 400 
 
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
@@ -30,36 +30,33 @@ def get_transcript_api():
             try:
                 transcript_to_fetch = transcript_list.find_generated_transcript(preferred_languages)
             except NoTranscriptFound:
+                # Error still JSON
                 return jsonify({"error": "No transcript found in the preferred languages for this video.", "video_id": video_id}), 404
         
-        # This transcript_data is the list of dictionaries (the "shit" you want to clean up for text output)
         transcript_data = transcript_to_fetch.fetch() 
         
-        # --- MODIFIED SECTION: Handle different output formats ---
         if output_format == 'text':
             formatter = TextFormatter()
-            # Format the transcript into a single plain text string
             plain_text_transcript = formatter.format_transcript(transcript_data)
-            return jsonify({
-                "video_id": video_id,
-                "transcript_format": "text",
-                "transcript": plain_text_transcript
-            })
+            # --- MODIFIED RESPONSE FOR TEXT OUTPUT ---
+            # We now return a Flask Response object with mimetype 'text/plain'
+            # This tells the browser to render it as plain text.
+            return Response(plain_text_transcript, mimetype='text/plain; charset=utf-8')
+            # --- END OF MODIFIED RESPONSE ---
         else: # Default or if output_format is 'json'
             return jsonify({
                 "video_id": video_id,
                 "transcript_format": "structured_json",
                 "transcript": transcript_data 
             })
-        # --- END OF MODIFIED SECTION ---
 
     except TranscriptsDisabled:
-        return jsonify({"error": "Transcripts are disabled for this video.", "video_id": video_id}), 403
+        return jsonify({"error": "Transcripts are disabled for this video.", "video_id": video_id}), 403 # Error still JSON
     except NoTranscriptFound:
-        return jsonify({"error": "No transcript available for this video ID (it might be invalid, private, deleted, or have no captions for specified languages).", "video_id": video_id}), 404
+        return jsonify({"error": "No transcript available for this video ID (it might be invalid, private, deleted, or have no captions for specified languages).", "video_id": video_id}), 404 # Error still JSON
     except Exception as e:
         print(f"An unexpected error occurred: {str(e)}")
-        return jsonify({"error": f"An server-side error occurred: {str(e)}", "video_id": video_id}), 500
+        return jsonify({"error": f"An server-side error occurred: {str(e)}", "video_id": video_id}), 500 # Error still JSON
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
