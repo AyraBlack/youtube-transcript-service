@@ -1,3 +1,4 @@
 Flask>=2.2,<3.1
 youtube-transcript-api>=0.6.2,<0.7.0
 gunicorn>=20.1.0,<23.0.0
+requests>=2.25.0,<3.0.0
