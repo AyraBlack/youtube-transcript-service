@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, Response, send_from_directory, url_for
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from youtube_transcript_api.formatters import TextFormatter
-from pytube import YouTube as PytubeYouTube # Alias to avoid confusion with YouTubeTranscriptApi
+from pytube import YouTube as PytubeYouTube # Alias to avoid confusion
 from pytube.exceptions import PytubeError as PytubeLibError
 import os
 import tempfile # For handling temporary cookie file
@@ -13,18 +13,27 @@ app.logger.setLevel(logging.INFO)
 
 # --- Configuration for Temporary Transcript Text Files ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Directory to store temporary plain text transcript files before they are served and deleted
 TEXT_TRANSCRIPTS_TEMP_DIR = os.path.join(BASE_DIR, "api_text_transcripts_temp")
 
 if not os.path.exists(TEXT_TRANSCRIPTS_TEMP_DIR):
     os.makedirs(TEXT_TRANSCRIPTS_TEMP_DIR)
     app.logger.info(f"Created temporary text transcripts directory: {TEXT_TRANSCRIPTS_TEMP_DIR}")
 
+# --- Read Proxy from Environment Variable ---
+PROXY_URL_FROM_ENV = os.environ.get('PROXY_URL')
+if PROXY_URL_FROM_ENV:
+    # Log only the host part for security if it's a full URL with auth
+    proxy_display = PROXY_URL_FROM_ENV.split('@')[-1] if '@' in PROXY_URL_FROM_ENV else PROXY_URL_FROM_ENV
+    app.logger.info(f"Proxy URL found in environment: {proxy_display}")
+else:
+    app.logger.info("No PROXY_URL environment variable set. Operating without proxy.")
+
 # --- Helper Function for Cookie File ---
 def get_cookie_file_path():
     cookie_content = os.environ.get('YOUTUBE_COOKIES_CONTENT')
     if cookie_content:
         try:
+            # Create in TEXT_TRANSCRIPTS_TEMP_DIR to ensure it's writable on Railway
             with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8', suffix='.txt', dir=TEXT_TRANSCRIPTS_TEMP_DIR) as tmp_cookie_file:
                 tmp_cookie_file.write(cookie_content)
                 app.logger.info(f"Temporary cookie file created at: {tmp_cookie_file.name}")
@@ -53,7 +62,7 @@ def get_video_info_api():
     if not video_id:
         return jsonify({"error": "Missing 'video_id' parameter"}), 400
 
-    video_url = f"https://www.google.com/url?sa=E&source=gmail&q=https://youtube-audio-transcriber-production.up.railway.app/api/extract_audio?url=https://youtu.be/mG4XXtpuSlk?si=j1Cj0bw5Muo_xuhI" # Construct full URL for pytube
+    video_url = f"https://www.google.com/url?sa=E&source=gmail&q=https://youtube-audio-transcriber-production.up.railway.app/api/extract_audio?url=https://youtu.be/mG4XXtpuSlk?si=j1Cj0bw5Muo_xuhI"
 
     response_data = {
         "video_id": video_id,
@@ -65,55 +74,72 @@ def get_video_info_api():
     
     temp_cookie_file_path = None
     temp_transcript_text_file_path = None
+    
+    # Store original proxy env vars if they exist, to restore later
+    original_http_proxy = os.environ.get('HTTP_PROXY')
+    original_https_proxy = os.environ.get('HTTPS_PROXY')
 
     try:
+        # --- Apply Proxy Settings if PROXY_URL_FROM_ENV is set ---
+        pytube_proxies = None
+        if PROXY_URL_FROM_ENV:
+            pytube_proxies = {'http': PROXY_URL_FROM_ENV, 'https': PROXY_URL_FROM_ENV}
+            os.environ['HTTP_PROXY'] = PROXY_URL_FROM_ENV
+            os.environ['HTTPS_PROXY'] = PROXY_URL_FROM_ENV
+            app.logger.info(f"Set HTTP_PROXY and HTTPS_PROXY for this request.")
+        else:
+            # Ensure they are unset if no proxy is configured for this app
+            if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+            if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+
         # 1. Get Title and Channel using Pytube
         try:
             app.logger.info(f"Fetching metadata with Pytube for video ID: {video_id}")
-            yt_pytube = PytubeYouTube(video_url)
+            # Pass proxies to PytubeYouTube if PROXY_URL_FROM_ENV is set
+            yt_pytube = PytubeYouTube(video_url, proxies=pytube_proxies)
             response_data["video_title"] = yt_pytube.title
             response_data["channel_name"] = yt_pytube.author
             app.logger.info(f"Pytube fetched Title: '{yt_pytube.title}', Channel: '{yt_pytube.author}'")
         except PytubeLibError as pe:
             app.logger.warning(f"Pytube error fetching metadata for {video_id}: {pe}. Transcript fetching will proceed.")
-            # Not a fatal error for transcript, but good to note.
-            # response_data["error"] = f"Pytube metadata error: {str(pe)}" # Optionally report this
         except Exception as e_pytube:
             app.logger.warning(f"Unexpected error with Pytube for {video_id}: {e_pytube}. Transcript fetching will proceed.")
-
 
         # 2. Get Transcript using YouTubeTranscriptApi
         temp_cookie_file_path = get_cookie_file_path()
         
+        transcript_api_kwargs = {}
         if temp_cookie_file_path:
-            app.logger.info(f"Attempting to list transcripts for {video_id} using cookies from: {temp_cookie_file_path}")
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=temp_cookie_file_path)
+            transcript_api_kwargs['cookies'] = temp_cookie_file_path
+            app.logger.info(f"Attempting to list transcripts for {video_id} using cookies.")
         else:
             app.logger.info(f"Attempting to list transcripts for {video_id} without cookies.")
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         
-        preferred_languages = ['ro', 'en'] # Prioritize Romanian, then English
-        transcript_to_fetch = None
+        # The youtube-transcript-api should now hopefully pick up the HTTP_PROXY/HTTPS_PROXY env vars
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, **transcript_api_kwargs)
+        
+        preferred_languages = ['ro', 'en'] 
+        transcript_to_fetch_data = None # Changed from transcript_to_fetch to avoid confusion
         fetched_lang = None
 
         for lang in preferred_languages:
             try:
                 app.logger.info(f"Trying to find '{lang}' transcript for {video_id}...")
-                transcript = transcript_list.find_transcript([lang])
-                transcript_to_fetch = transcript.fetch()
+                transcript_obj = transcript_list.find_transcript([lang])
+                transcript_to_fetch_data = transcript_obj.fetch()
                 fetched_lang = lang
                 app.logger.info(f"Found and fetched '{lang}' transcript for {video_id}.")
-                break # Found a preferred language
+                break 
             except NoTranscriptFound:
                 app.logger.info(f"No '{lang}' transcript found for {video_id}.")
-                continue # Try next preferred language
+                continue 
         
-        if not transcript_to_fetch: # If neither preferred lang found, try auto-generated in preferred order
+        if not transcript_to_fetch_data: 
             app.logger.info(f"No manual transcript in {preferred_languages}. Trying auto-generated for {video_id}...")
             for lang in preferred_languages:
                 try:
-                    transcript = transcript_list.find_generated_transcript([lang])
-                    transcript_to_fetch = transcript.fetch()
+                    transcript_obj = transcript_list.find_generated_transcript([lang])
+                    transcript_to_fetch_data = transcript_obj.fetch()
                     fetched_lang = f"{lang} (auto-generated)"
                     app.logger.info(f"Found and fetched auto-generated '{lang}' transcript for {video_id}.")
                     break
@@ -121,15 +147,13 @@ def get_video_info_api():
                     app.logger.info(f"No auto-generated '{lang}' transcript for {video_id}.")
                     continue
         
-        if not transcript_to_fetch:
+        if not transcript_to_fetch_data:
             response_data["error"] = "No transcript found in Romanian or English (manual or auto-generated)."
             app.logger.warning(response_data["error"] + f" for video ID: {video_id}")
-            # No need to delete temp_cookie_file_path here as it's handled in finally
             return jsonify(response_data), 404
 
-        # 3. Format to plain text and save to a temporary file
         formatter = TextFormatter()
-        plain_text_transcript = formatter.format_transcript(transcript_to_fetch)
+        plain_text_transcript = formatter.format_transcript(transcript_to_fetch_data)
         
         temp_transcript_filename = f"transcript_{video_id}_{uuid.uuid4().hex[:8]}.txt"
         temp_transcript_text_file_path = os.path.join(TEXT_TRANSCRIPTS_TEMP_DIR, temp_transcript_filename)
@@ -138,7 +162,6 @@ def get_video_info_api():
             f.write(plain_text_transcript)
         app.logger.info(f"Plain text transcript saved to temporary file: {temp_transcript_text_file_path}")
 
-        # 4. Generate download URL for the plain text transcript
         response_data["transcript_download_url"] = url_for('serve_plain_text_transcript', 
                                                            filename=temp_transcript_filename, 
                                                            _external=True)
@@ -150,7 +173,7 @@ def get_video_info_api():
         response_data["error"] = "Transcripts are disabled for this video."
         app.logger.warning(response_data["error"] + f" for video ID: {video_id}")
         return jsonify(response_data), 403
-    except NoTranscriptFound: # Fallback, though specific language checks are done above
+    except NoTranscriptFound: 
         response_data["error"] = "No transcript available for this video ID."
         app.logger.warning(response_data["error"] + f" for video ID: {video_id}")
         return jsonify(response_data), 404
@@ -160,9 +183,20 @@ def get_video_info_api():
         return jsonify(response_data), 500
     finally:
         safe_delete_file(temp_cookie_file_path)
-        # DO NOT delete temp_transcript_text_file_path here. It will be deleted after serving.
+        # Restore original proxy settings or unset if they were set by this request
+        if PROXY_URL_FROM_ENV: # Only if we modified them
+            if original_http_proxy:
+                os.environ['HTTP_PROXY'] = original_http_proxy
+            elif 'HTTP_PROXY' in os.environ: # If it was set by us and not originally
+                del os.environ['HTTP_PROXY']
+            
+            if original_https_proxy:
+                os.environ['HTTPS_PROXY'] = original_https_proxy
+            elif 'HTTPS_PROXY' in os.environ: # If it was set by us and not originally
+                del os.environ['HTTPS_PROXY']
+            app.logger.info("Restored original HTTP_PROXY/HTTPS_PROXY environment variables.")
 
-# --- New Route to Serve Plain Text Transcripts ---
+
 @app.route('/serve_text_transcript/<filename>')
 def serve_plain_text_transcript(filename):
     app.logger.info(f"Request to serve plain text transcript: {filename}")
@@ -172,21 +206,9 @@ def serve_plain_text_transcript(filename):
             app.logger.error(f"Temporary transcript file not found for serving: {file_path_to_serve}")
             return jsonify({"error": "Transcript file not found or already served."}), 404
 
-        # Send the file content as plain text
         response = send_from_directory(TEXT_TRANSCRIPTS_TEMP_DIR, filename, 
                                        mimetype='text/plain; charset=utf-8', 
-                                       as_attachment=False) # as_attachment=False to display in browser
-        
-        # Schedule file for deletion after request is complete using Flask's after_this_request
-        # This is a common pattern but needs careful handling in some server setups.
-        # A simpler approach for now might be to rely on periodic cleanup or short-lived files.
-        # For this example, we'll try to delete it immediately after creating the response.
-        # However, this might be too soon if the file isn't fully sent.
-        # A more robust solution would be a background task or specific cleanup endpoint.
-        # For now, let's delete it after creating the response.
-        # This is NOT ideal for production as the file might be deleted before fully sent.
-        # A better way is to have n8n confirm download and then call a cleanup endpoint, or a timed cleanup.
-        # For simplicity now, we delete. If issues, we can remove this immediate delete.
+                                       as_attachment=False)
         
         @response.call_on_close
         def process_after_request():
@@ -195,18 +217,20 @@ def serve_plain_text_transcript(filename):
 
         return response
         
-    except FileNotFoundError: # Should be caught by os.path.exists above, but as a fallback
+    except FileNotFoundError: 
         app.logger.error(f"File not found (fallback) for serving: {file_path_to_serve}")
         return jsonify({"error": "File not found."}), 404
     except Exception as e:
         app.logger.error(f"Error serving plain text transcript {filename}: {e}", exc_info=True)
-        safe_delete_file(file_path_to_serve) # Attempt cleanup on error too
+        safe_delete_file(file_path_to_serve) 
         return jsonify({"error": "Could not serve transcript file."}), 500
 
 if __name__ == "__main__":
-    if not app.debug:
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    if not app.debug: # Only configure basicConfig if not in debug mode
+        # For local run, if you want to see logging, you can set up basicConfig here
+        # But Gunicorn usually handles logging in production.
+        pass # Using app.logger which is configured when app is created.
     
     app.logger.info("--- Starting YouTube Info API (Flask Development Server) ---")
-    port = int(os.environ.get("PORT", 8081)) # Use a different port if needed
+    port = int(os.environ.get("PORT", 8081)) 
     app.run(host='0.0.0.0', port=port, debug=True)
